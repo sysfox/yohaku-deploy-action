@@ -189,12 +189,14 @@ jobs:
             docker stop yohaku 2>/dev/null || true
             docker rm yohaku 2>/dev/null || true
 
+            # Source /app/.env so API_URL etc. are available at runtime
             docker run -d \
               --name yohaku \
               --restart always \
               -p 2323:2323 \
               -v $HOME/yohaku/.env:/app/.env \
-              yohaku:latest
+              yohaku:latest \
+              sh -c "set -a; . /app/.env 2>/dev/null || true; set +a; echo 'Mix Space Web [Yohaku] Image.' && node apps/web/server.js"
 
             # Retain image for rollback
             mkdir -p $HOME/yohaku/images
