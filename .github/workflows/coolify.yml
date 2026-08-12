@@ -1,0 +1,594 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 0 * * 3,5'
+  workflow_dispatch:
+    inputs:
+      deploy_method:
+        description: '部署方式'
+        default: 'docker'
+        type: choice
+        options:
+          - docker
+          - pm2
+  repository_dispatch:
+    types: [trigger-workflow]
+
+permissions:
+  contents: write
+  packages: write  # 推送 GHCR 镜像所需
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HASH_FILE: build_hash
+  SOURCE_REPO: innei-dev/Yohaku
+  DEPLOY_METHOD: docker  # 部署方式：docker (GHCR + Coolify) 或 pm2。手动运行时可通过 workflow_dispatch input 覆盖
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    if: ${{ github.event.head_commit.message != 'Update hash file' }}
+
+    outputs:
+      hash_content: ${{ steps.read_hash.outputs.hash_content }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Read HASH_FILE content from hash-track branch
+        id: read_hash
+        run: |
+          git fetch origin hash-track 2>/dev/null || true
+          content=$(git show origin/hash-track:build_hash 2>/dev/null || echo "")
+          echo "hash_content=$content" >> "$GITHUB_OUTPUT"
+
+  check:
+    name: Check Should Rebuild
+    runs-on: ubuntu-latest
+    needs: prepare
+    outputs:
+      canceled: ${{ steps.use_content.outputs.canceled }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+          lfs: true
+          submodules: recursive
+
+      - name: Use content from prev job and compare
+        id: use_content
+        env:
+          FILE_HASH: ${{ needs.prepare.outputs.hash_content }}
+        run: |
+          file_hash=$FILE_HASH
+          current_hash=$(git rev-parse --short HEAD)
+          echo "File Hash: $file_hash"
+          echo "Current Git Hash: $current_hash"
+          if [ "$file_hash" == "$current_hash" ]; then
+            echo "Hashes match. Stopping workflow."
+            echo "canceled=true" >> $GITHUB_OUTPUT
+          else
+            echo "Hashes do not match. Continuing workflow."
+          fi
+
+  build-and-deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    needs: check
+    if: ${{ needs.check.outputs.canceled != 'true' }}
+
+    outputs:
+      sha_short: ${{ steps.sha.outputs.sha_short }}
+      build_result: ${{ steps.results.outputs.build_result }}
+      push_result: ${{ steps.results.outputs.push_result }}
+      scp_result: ${{ steps.results.outputs.scp_result }}
+      deploy_result: ${{ steps.results.outputs.deploy_result }}
+      total_duration: ${{ steps.results.outputs.total_duration }}
+      image_version: ${{ steps.results.outputs.image_version }}
+      build_duration: ${{ steps.results.outputs.build_duration }}
+      scp_duration: ${{ steps.results.outputs.scp_duration }}
+      deploy_duration: ${{ steps.results.outputs.deploy_duration }}
+      deploy_method: ${{ steps.deploy_method.outputs.method }}
+
+    steps:
+      # ═══════════════════════════════════════════
+      # Common Setup
+      # ═══════════════════════════════════════════
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+          lfs: true
+          submodules: recursive
+
+      - name: Checkout LFS objects
+        run: git lfs checkout
+
+      - name: Start timing
+        id: timing
+        run: echo "start_time=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Override deploy method from workflow input
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_method != ''
+        run: echo "DEPLOY_METHOD=${{ github.event.inputs.deploy_method }}" >> $GITHUB_ENV
+
+      - name: Record deploy method
+        id: deploy_method
+        run: echo "method=${DEPLOY_METHOD:-docker}" >> "$GITHUB_OUTPUT"
+
+      - name: Store short SHA
+        id: sha
+        run: |
+          sha_short=$(git rev-parse --short HEAD)
+          echo "sha_short=$sha_short" >> "$GITHUB_OUTPUT"
+
+      # ═══════════════════════════════════════════
+      # Docker Path (GHCR + Coolify)
+      # ═══════════════════════════════════════════
+      - name: Compute image name (lowercase)
+        if: env.DEPLOY_METHOD == 'docker'
+        id: image
+        run: |
+          owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/${owner_lc}/yohaku" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: env.DEPLOY_METHOD == 'docker'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        if: env.DEPLOY_METHOD == 'docker'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        if: env.DEPLOY_METHOD == 'docker'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest
+            type=sha
+
+      - name: Build and push Docker image
+        if: env.DEPLOY_METHOD == 'docker'
+        id: build_push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # ⚠️ 敏感密钥（S3/Webhook/TMDB 等）不再注入镜像，
+          # 全部改为在 Coolify 资源面板中配置环境变量，运行时注入。
+          # 仅保留影响构建产物（SSR 预渲染）的非敏感参数。
+          build-args: |
+            BASE_URL=${{ secrets.BASE_URL }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record build end (Docker)
+        if: env.DEPLOY_METHOD == 'docker'
+        id: timing_build_end
+        run: echo "end=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger Coolify deploy
+        if: env.DEPLOY_METHOD == 'docker'
+        id: deploy_coolify
+        env:
+          COOLIFY_URL: ${{ secrets.COOLIFY_URL }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+          COOLIFY_RESOURCE_UUID: ${{ secrets.COOLIFY_RESOURCE_UUID }}
+        run: |
+          if [ -z "$COOLIFY_TOKEN" ] || [ -z "$COOLIFY_RESOURCE_UUID" ]; then
+            echo "Coolify 凭证未配置，跳过主动触发（Coolify 将按自身策略拉取镜像）"
+            exit 0
+          fi
+
+          RESPONSE=$(curl -sf -X POST \
+            "${COOLIFY_URL}/api/v1/deploy?uuid=${COOLIFY_RESOURCE_UUID}&force_rebuild=false" \
+            -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+            -H "Content-Type: application/json")
+          echo "Trigger response: $RESPONSE"
+
+          DEPLOY_UUID=$(echo "$RESPONSE" | jq -r '.deployments.uuid // empty')
+          if [ -z "$DEPLOY_UUID" ]; then
+            echo "无法获取部署 UUID"
+            exit 1
+          fi
+
+          echo "Deployment UUID: $DEPLOY_UUID"
+
+          # 轮询部署状态（每 15s 一次，最多 10 分钟）
+          for i in $(seq 1 40); do
+            sleep 15
+            STATUS=$(curl -sf "${COOLIFY_URL}/api/v1/deployments/${DEPLOY_UUID}" \
+              -H "Authorization: Bearer ${COOLIFY_TOKEN}" | jq -r '.status // empty')
+            echo "[$i/40] 部署状态: $STATUS"
+            case "$STATUS" in
+              finished) echo "✅ Coolify 部署完成"; exit 0 ;;
+              error)    echo "❌ Coolify 部署失败"; exit 1 ;;
+            esac
+          done
+
+          echo "⏱️ 部署状态轮询超时"
+          exit 1
+
+      - name: Record deploy end (Docker)
+        if: env.DEPLOY_METHOD == 'docker'
+        id: timing_deploy_end
+        run: echo "end=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      # ═══════════════════════════════════════════
+      # PM2 Path（保留作为备用方案）
+      # ═══════════════════════════════════════════
+      - name: Setup Node.js
+        if: env.DEPLOY_METHOD == 'pm2'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        if: env.DEPLOY_METHOD == 'pm2'
+        run: npm install -g pnpm@latest
+
+      - name: Install dependencies
+        if: env.DEPLOY_METHOD == 'pm2'
+        run: pnpm install
+
+      - name: Build standalone
+        if: env.DEPLOY_METHOD == 'pm2'
+        id: build_pm2
+        run: |
+          pnpm --filter @yohaku/web build:ci
+          mkdir -p deploy
+          cd apps/web/.next
+          rm -rf cache
+          cp -r ../public ./standalone/public
+          mv ./static ./standalone/apps/web/.next/static
+          cd ./standalone
+          echo ';process.title = "Yohaku (NextJS)"' >> server.js
+          cd ../..
+          zip --symlinks -r ${{ github.workspace }}/deploy/release.zip ./*
+
+      - name: Record build end (PM2)
+        if: env.DEPLOY_METHOD == 'pm2'
+        id: timing_build_end_pm2
+        run: echo "end=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Copy standalone to server (PM2)
+        if: env.DEPLOY_METHOD == 'pm2'
+        id: scp_pm2
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USER }}
+          password: ${{ secrets.PASSWORD }}
+          key: ${{ secrets.KEY }}
+          port: ${{ secrets.PORT }}
+          source: deploy/release.zip
+          target: /tmp/yohaku-deploy
+          strip_components: 1
+          timeout: 10m
+
+      - name: Record scp end (PM2)
+        if: env.DEPLOY_METHOD == 'pm2'
+        id: timing_scp_end_pm2
+        run: echo "end=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy via PM2 on server
+        if: env.DEPLOY_METHOD == 'pm2'
+        id: deploy_pm2
+        uses: appleboy/ssh-action@master
+        with:
+          command_timeout: 5m
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USER }}
+          password: ${{ secrets.PASSWORD }}
+          key: ${{ secrets.KEY }}
+          port: ${{ secrets.PORT }}
+          script: |
+            set -e
+
+            DEPLOY_DIR=$HOME/yohaku
+
+            # 保留上一版本用于回滚
+            if [ -d "$DEPLOY_DIR/standalone" ]; then
+              rm -rf "$DEPLOY_DIR/standalone.prev"
+              mv "$DEPLOY_DIR/standalone" "$DEPLOY_DIR/standalone.prev"
+            fi
+
+            mkdir -p "$DEPLOY_DIR/standalone"
+            unzip -o /tmp/yohaku-deploy/release.zip -d "$DEPLOY_DIR/standalone"
+
+            cp "$DEPLOY_DIR/ecosystem.config.js" "$DEPLOY_DIR/standalone/ecosystem.config.js" 2>/dev/null || true
+
+            cd "$DEPLOY_DIR/standalone"
+            npm install sharp 2>/dev/null || true
+
+            pm2 restart "$DEPLOY_DIR/standalone/ecosystem.config.js" 2>/dev/null || \
+              pm2 start "$DEPLOY_DIR/standalone/ecosystem.config.js"
+
+            pm2 save
+
+            echo "Deployed yohaku:${{ github.sha }} via PM2"
+            pm2 list --no-color | head -5
+
+      - name: Record deploy end (PM2)
+        if: env.DEPLOY_METHOD == 'pm2'
+        id: timing_deploy_end_pm2
+        run: echo "end=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      # ═══════════════════════════════════════════
+      # Common Finish
+      # ═══════════════════════════════════════════
+      - name: Compile results
+        id: results
+        if: always()
+        run: |
+          now=$(date +%s)
+          start=${{ steps.timing.outputs.start_time }}
+          echo "total_duration=$((now - start))" >> "$GITHUB_OUTPUT"
+
+          DEPLOY_METHOD="${{ env.DEPLOY_METHOD }}"
+
+          if [ "$DEPLOY_METHOD" = "pm2" ]; then
+            echo "build_result=${{ steps.build_pm2.conclusion }}" >> "$GITHUB_OUTPUT"
+            echo "push_result=skipped" >> "$GITHUB_OUTPUT"
+            echo "scp_result=${{ steps.scp_pm2.conclusion }}" >> "$GITHUB_OUTPUT"
+            echo "deploy_result=${{ steps.deploy_pm2.conclusion }}" >> "$GITHUB_OUTPUT"
+
+            build_end='${{ steps.timing_build_end_pm2.outputs.end }}'
+            scp_end='${{ steps.timing_scp_end_pm2.outputs.end }}'
+            deploy_end='${{ steps.timing_deploy_end_pm2.outputs.end }}'
+          else
+            echo "build_result=${{ steps.build_push.conclusion }}" >> "$GITHUB_OUTPUT"
+            echo "push_result=${{ steps.build_push.conclusion }}" >> "$GITHUB_OUTPUT"
+            echo "scp_result=skipped" >> "$GITHUB_OUTPUT"
+            echo "deploy_result=${{ steps.deploy_coolify.conclusion }}" >> "$GITHUB_OUTPUT"
+            echo "image_version=${{ steps.meta.outputs.version }}" >> "$GITHUB_OUTPUT"
+
+            build_end='${{ steps.timing_build_end.outputs.end }}'
+            scp_end=''
+            deploy_end='${{ steps.timing_deploy_end.outputs.end }}'
+          fi
+
+          if [ -n "$build_end" ]; then
+            echo "build_duration=$((build_end - start))" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$DEPLOY_METHOD" = "pm2" ]; then
+            if [ -n "$build_end" ] && [ -n "$scp_end" ]; then
+              echo "scp_duration=$((scp_end - build_end))" >> "$GITHUB_OUTPUT"
+            fi
+            if [ -n "$scp_end" ] && [ -n "$deploy_end" ]; then
+              echo "deploy_duration=$((deploy_end - scp_end))" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            if [ -n "$build_end" ] && [ -n "$deploy_end" ]; then
+              echo "deploy_duration=$((deploy_end - build_end))" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: After deploy script
+        run: |
+          hash=${{ steps.sha.outputs.sha_short }}
+          ${{ secrets.AFTER_DEPLOY_SCRIPT }}
+
+  store:
+    name: Store artifact commit version
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Create or switch to hash-track branch
+        run: |
+          git fetch origin hash-track 2>/dev/null || true
+          if git rev-parse origin/hash-track >/dev/null 2>&1; then
+            git checkout -b hash-track origin/hash-track
+          else
+            git checkout --orphan hash-track
+            git rm -rf .
+          fi
+
+      - name: Write hash to file
+        env:
+          SHA_SHORT: ${{ needs.build-and-deploy.outputs.sha_short }}
+        run: echo $SHA_SHORT > ${{ env.HASH_FILE }}
+
+      - name: Commit and push
+        env:
+          SHA_SHORT: ${{ needs.build-and-deploy.outputs.sha_short }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
+          git add build_hash
+          if ! git diff --cached --quiet; then
+            git commit -m "Update hash file to $SHA_SHORT"
+            git push origin hash-track
+          fi
+
+  notify:
+    name: Send WeChat Notification
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+    if: always() && needs.build-and-deploy.result != 'skipped'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 1
+
+      - name: Get commit info
+        id: commit
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          git log -1 --pretty=format:'%s' > /tmp/commit_msg.txt
+
+      - name: Send PushPlus notification
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          DEPLOY_RESULT: ${{ needs.build-and-deploy.result }}
+          DEPLOY_METHOD: ${{ needs.build-and-deploy.outputs.deploy_method }}
+          SHA_SHORT: ${{ steps.commit.outputs.sha_short }}
+          BUILD_RESULT: ${{ needs.build-and-deploy.outputs.build_result }}
+          PUSH_RESULT: ${{ needs.build-and-deploy.outputs.push_result }}
+          SCP_RESULT: ${{ needs.build-and-deploy.outputs.scp_result }}
+          DEPLOY_PHASE_RESULT: ${{ needs.build-and-deploy.outputs.deploy_result }}
+          TOTAL_DURATION: ${{ needs.build-and-deploy.outputs.total_duration }}
+          IMAGE_VERSION: ${{ needs.build-and-deploy.outputs.image_version }}
+          BUILD_DURATION: ${{ needs.build-and-deploy.outputs.build_duration }}
+          SCP_DURATION: ${{ needs.build-and-deploy.outputs.scp_duration }}
+          DEPLOY_PHASE_DURATION: ${{ needs.build-and-deploy.outputs.deploy_duration }}
+          TRIGGER_EVENT: ${{ github.event_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$PUSHPLUS_TOKEN" ]; then
+            echo "PUSHPLUS_TOKEN not set, skipping notification"
+            exit 0
+          fi
+
+          # --- Status ---
+          if [ "$DEPLOY_RESULT" = "success" ]; then
+            STATUS_ICON="✅"
+            STATUS_TEXT="成功"
+          else
+            STATUS_ICON="❌"
+            STATUS_TEXT="失败"
+          fi
+
+          # --- Phase icons ---
+          phase_icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              skipped) echo "⏭️" ;;
+              *)       echo "❓" ;;
+            esac
+          }
+
+          BUILD_ICON=$(phase_icon "$BUILD_RESULT")
+          PUSH_ICON=$(phase_icon "$PUSH_RESULT")
+          SCP_ICON=$(phase_icon "$SCP_RESULT")
+          DEPLOY_ICON=$(phase_icon "$DEPLOY_PHASE_RESULT")
+
+          # --- Trigger text ---
+          case "$TRIGGER_EVENT" in
+            push)                TRIGGER_TEXT="代码推送" ;;
+            schedule)            TRIGGER_TEXT="定时触发" ;;
+            workflow_dispatch)   TRIGGER_TEXT="手动运行" ;;
+            repository_dispatch) TRIGGER_TEXT="外部触发" ;;
+            *)                   TRIGGER_TEXT="$TRIGGER_EVENT" ;;
+          esac
+
+          # --- Duration ---
+          if [ -n "$TOTAL_DURATION" ]; then
+            DURATION_MIN=$((TOTAL_DURATION / 60))
+            DURATION_SEC=$((TOTAL_DURATION % 60))
+            DURATION_TEXT="${DURATION_MIN}m ${DURATION_SEC}s"
+          else
+            DURATION_TEXT="N/A"
+          fi
+
+          # --- Phase durations ---
+          format_duration() {
+            if [ -z "$1" ] || [ "$1" = "N/A" ]; then
+              echo "N/A"
+            else
+              m=$(( $1 / 60 ))
+              s=$(( $1 % 60 ))
+              echo "${m}m ${s}s"
+            fi
+          }
+
+          BUILD_DURATION_TEXT=$(format_duration "$BUILD_DURATION")
+          SCP_DURATION_TEXT=$(format_duration "$SCP_DURATION")
+          DEPLOY_DURATION_TEXT=$(format_duration "$DEPLOY_PHASE_DURATION")
+
+          # --- Commit message ---
+          COMMIT_MSG=$(cat /tmp/commit_msg.txt 2>/dev/null || echo "N/A")
+
+          # --- Image info (define BEFORE use) ---
+          IMAGE_HINT="${IMAGE_VERSION:+（\`${IMAGE_VERSION}\`）}"
+
+          # --- Build phase rows ---
+          if [ "$DEPLOY_METHOD" = "pm2" ]; then
+            PHASE_ROWS="\
+
+          | 构建 | ${BUILD_ICON} ${BUILD_RESULT} | ${BUILD_DURATION_TEXT} |
+          | 传输到服务器 | ${SCP_ICON} ${SCP_RESULT} | ${SCP_DURATION_TEXT} |
+          | 部署启动 | ${DEPLOY_ICON} ${DEPLOY_PHASE_RESULT} | ${DEPLOY_DURATION_TEXT} |"
+          else
+            PHASE_ROWS="\
+
+          | 构建并推送 GHCR ${IMAGE_HINT} | ${BUILD_ICON} ${BUILD_RESULT} | ${BUILD_DURATION_TEXT} |
+          | Coolify 部署 | ${DEPLOY_ICON} ${DEPLOY_PHASE_RESULT} | ${DEPLOY_DURATION_TEXT} |"
+          fi
+
+          # --- Build content ---
+          TIMESTAMP=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')
+
+          CONTENT="## Yohaku 部署 ${STATUS_TEXT}
+
+          ### 基本信息
+
+          | 项目 | 内容 |
+          |------|------|
+          | 状态 | ${STATUS_ICON} ${STATUS_TEXT} |
+          | 版本 | \`${SHA_SHORT}\` |
+          | 触发方式 | ${TRIGGER_TEXT} |
+          | 运行编号 | #${RUN_NUMBER} |
+          | 部署方式 | ${DEPLOY_METHOD} |
+          | 总用时 | ${DURATION_TEXT} |
+          | 时间 | ${TIMESTAMP} |
+
+          ### 各阶段结果
+
+          | 阶段 | 结果 | 用时 |
+          |------|------|------|
+          ${PHASE_ROWS}
+
+          ### 提交信息
+          > ${COMMIT_MSG}
+
+          [查看 GitHub Actions 运行详情](${RUN_URL})"
+
+          # --- Send ---
+          PAYLOAD=$(jq -n \
+            --arg token "$PUSHPLUS_TOKEN" \
+            --arg title "Yohaku 部署 ${STATUS_TEXT}" \
+            --arg content "$CONTENT" \
+            --arg template "markdown" \
+            '{token: $token, title: $title, content: $content, template: $template}')
+
+          curl -s -X POST "https://www.pushplus.plus/send" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
+
+          echo ""
+          echo "PushPlus notification sent"
